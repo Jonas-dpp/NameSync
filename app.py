@@ -348,12 +348,13 @@ def render_standard_entry_form(group_id: str, user_id: int) -> None:
                 if not normalized_input:
                     st.warning("Bitte gib einen Namen ein.")
                 else:
-                    added_id = database.add_name_suggestion(group_id, user_id, normalized_input, gender="neutral")
-                    if added_id:
-                        st.success(f"'{normalized_input.title()}' wurde hinzugefügt!")
-                        st.rerun()
-                    else:
-                        st.warning("Ungültiger Name.")
+                    try:
+                        added_id = database.add_name_suggestion(group_id, user_id, normalized_input, gender="neutral")
+                        if added_id:
+                            st.success(f"'{normalized_input.title()}' wurde hinzugefügt!")
+                            st.rerun()
+                    except ValueError as val_err:
+                        st.warning(str(val_err))
 
     with col2:
         st.markdown("### 📋 Deine eingereichten Namen")
@@ -403,9 +404,12 @@ def render_gender_differentiable_entry_form(group_id: str, user_id: int) -> None
                 if not normalized:
                     st.warning("Bitte einen Namen eingeben.")
                 else:
-                    database.add_name_suggestion(group_id, user_id, normalized, gender="male")
-                    st.success(f"'{normalized.title()}' wurde zu den Jungennamen hinzugefügt!")
-                    st.rerun()
+                    try:
+                        database.add_name_suggestion(group_id, user_id, normalized, gender="male")
+                        st.success(f"'{normalized.title()}' wurde zu den Jungennamen hinzugefügt!")
+                        st.rerun()
+                    except ValueError as val_err:
+                        st.warning(str(val_err))
 
         st.markdown("#### 💙 Deine Jungennamen")
         male_names = database.get_user_names(group_id, user_id, gender="male")
@@ -446,9 +450,12 @@ def render_gender_differentiable_entry_form(group_id: str, user_id: int) -> None
                 if not normalized:
                     st.warning("Bitte einen Namen eingeben.")
                 else:
-                    database.add_name_suggestion(group_id, user_id, normalized, gender="female")
-                    st.success(f"'{normalized.title()}' wurde zu den Mädchennamen hinzugefügt!")
-                    st.rerun()
+                    try:
+                        database.add_name_suggestion(group_id, user_id, normalized, gender="female")
+                        st.success(f"'{normalized.title()}' wurde zu den Mädchennamen hinzugefügt!")
+                        st.rerun()
+                    except ValueError as val_err:
+                        st.warning(str(val_err))
 
         st.markdown("#### 💗 Deine Mädchennamen")
         female_names = database.get_user_names(group_id, user_id, gender="female")
