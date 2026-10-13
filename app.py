@@ -37,6 +37,25 @@ def clear_session_and_url() -> None:
     st.rerun()
 
 
+def parse_group_param(raw_param: str) -> tuple[str, bool]:
+    """Parses raw group_id query parameter to check for /overview suffix.
+
+    Args:
+        raw_param: Raw query parameter value.
+
+    Returns:
+        tuple[str, bool]: (clean_group_id, is_overview_route)
+    """
+    if not raw_param:
+        return "", False
+
+    clean_param = raw_param.strip()
+    if clean_param.lower().endswith("/overview"):
+        clean_id = clean_param[:-9].rstrip("/")
+        return clean_id, True
+    return clean_param, False
+
+
 def render_home_page() -> None:
     """Renders the inviting home page when no group parameter is present."""
     st.title("Name Sync 🤝✨")
@@ -63,13 +82,104 @@ def render_home_page() -> None:
             st.error(f"Fehler beim Erstellen der Gruppe: {exc}")
 
 
+def render_overview_content(group_id: str) -> None:
+    """Renders ranking and match statistics (public overview, excludes admin transparency)."""
+    gender_lists_enabled = database.get_gender_lists_enabled(group_id)
+
+    st.markdown("### 🏆 Beliebteste Namen")
+    if gender_lists_enabled:
+        c_m, c_f = st.columns(2)
+
+        with c_m:
+            st.markdown("#### 💙 Beliebteste Jungennamen")
+            m_ranking = database.get_group_name_ranking(group_id, gender="male")
+            if not m_ranking:
+                st.info("Noch keine Jungennamen vorgeschlagen.")
+            else:
+                df_m = pd.DataFrame(m_ranking, columns=["Name", "Stimmen"])
+                st.dataframe(df_m, use_container_width=True, hide_index=True)
+
+        with c_f:
+            st.markdown("#### 💗 Beliebteste Mädchennamen")
+            f_ranking = database.get_group_name_ranking(group_id, gender="female")
+            if not f_ranking:
+                st.info("Noch keine Mädchennamen vorgeschlagen.")
+            else:
+                df_f = pd.DataFrame(f_ranking, columns=["Name", "Stimmen"])
+                st.dataframe(df_f, use_container_width=True, hide_index=True)
+    else:
+        ranking = database.get_group_name_ranking(group_id)
+        if not ranking:
+            st.info("Noch keine Namensvorschläge in dieser Gruppe eingereicht.")
+        else:
+            df = pd.DataFrame(ranking, columns=["Name", "Stimmen"])
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                st.bar_chart(df.set_index("Name"))
+            with c2:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    st.markdown("### 🤝 Namens-Überschneidungen")
+    if gender_lists_enabled:
+        st.markdown("#### 💙 Überschneidungen Jungennamen")
+        m_matches = database.get_group_user_matches(group_id, gender="male")
+        if not m_matches:
+            st.info("Keine Überschneidungen bei Jungennamen.")
+        else:
+            for u1, u2, count, shared in m_matches:
+                st.write(f"⭐ **{u1} & {u2}**: {count} gemeinsame(r) Jungenname(n) ({', '.join(shared)})")
+
+        st.divider()
+
+        st.markdown("#### 💗 Überschneidungen Mädchennamen")
+        f_matches = database.get_group_user_matches(group_id, gender="female")
+        if not f_matches:
+            st.info("Keine Überschneidungen bei Mädchennamen.")
+        else:
+            for u1, u2, count, shared in f_matches:
+                st.write(f"⭐ **{u1} & {u2}**: {count} gemeinsame(r) Mädchenname(n) ({', '.join(shared)})")
+    else:
+        matches = database.get_group_user_matches(group_id)
+        if not matches:
+            st.info("Noch keine Namens-Überschneidungen vorhanden.")
+        else:
+            for user1, user2, shared_count, shared_names in matches:
+                names_str = ", ".join(shared_names)
+                st.markdown(
+                    f"⭐ **{user1} & {user2}**: **{shared_count}** gemeinsame(r) Name(n)  \n"
+                    f"*Gemeinsam:* {names_str}"
+                )
+                st.divider()
+
+
+def render_overview_view(group_id: str) -> None:
+    """Renders standalone Overview page (e.g. via /overview route)."""
+    if not database.group_exists(group_id):
+        st.error("Diese Gruppe existiert nicht mehr.")
+        if st.button("Zurück zur Startseite", type="primary"):
+            clear_session_and_url()
+        return
+
+    st.title("Name Sync 🤝✨ - Übersicht")
+
+    # Navigation link back to main group page
+    if st.button("⬅️ Zur Gruppen-Hauptseite / Login"):
+        st.query_params["group_id"] = group_id
+        st.rerun()
+
+    st.divider()
+    render_overview_content(group_id)
+
+
 def render_participant_interface(group_id: str) -> None:
     """Renders participant UI, onboarding, name entry, and admin dashboard."""
     # 1. Check if group exists (separately managed DB)
     if not database.group_exists(group_id):
         st.error(
             "Diese Gruppe existiert nicht mehr. Der Link ist ungültig oder "
-            "die Gruppe wurde vom Admin oder nach 7 Tagen inaktivität gelöscht."
+            "die Gruppe wurde vom Admin oder nach 7 Tagen Inaktivität gelöscht."
         )
         if st.button("Zurück zur Startseite", type="primary"):
             clear_session_and_url()
@@ -87,71 +197,136 @@ def render_participant_interface(group_id: str) -> None:
     if current_user:
         st.session_state.is_admin = current_user["is_admin"]
 
-    # 3. Check group member limit for new users
-    user_count = database.get_user_count(group_id)
-    if current_user is None and user_count >= MAX_GROUP_MEMBERS:
-        st.error(f"Diese Gruppe ist bereits voll (Maximal {MAX_GROUP_MEMBERS} Personen).")
-        if st.button("Zur Startseite"):
-            clear_session_and_url()
-        return
-
     st.title("Name Sync 🤝✨")
 
-    # Display Share Link Header
-    with st.expander("🔗 Einladungslink für diese Gruppe", expanded=False):
-        st.info("Teile diese URL mit anderen Teilnehmern:")
-        st.code(st.query_params.to_dict().get("group_id", group_id), language="text")
+    # Display Share Links Header
+    with st.expander("🔗 Einladungslinks für diese Gruppe", expanded=False):
+        st.info("Teile diese Links mit anderen Teilnehmern:")
+        st.write("**Einladungslink (Eintreten & Abstimmen):**")
+        st.code(group_id, language="text")
+        st.write("**Öffentlicher Übersichtslink (Nur Ergebnisse):**")
+        st.code(f"{group_id}/overview", language="text")
 
     st.divider()
 
-    # 4. Onboarding Flow if user has no user_id in session
+    # 3. Onboarding / Login Flow if user has no user_id in session
     if st.session_state.get("user_id") is None:
-        st.subheader("Willkommen in der Gruppe!")
-        with st.form("onboarding_form"):
+        user_count = database.get_user_count(group_id)
+        st.subheader("Anmelden oder Registrieren")
+        st.write(
+            "Gib deinen Namen und ein Passwort ein. Falls du bereits in dieser Gruppe registriert bist, "
+            "wirst du eingeloggt. Wenn nicht, wird ein neues Profil für dich erstellt."
+        )
+
+        with st.form("login_onboarding_form"):
             display_name_input = st.text_input(
-                "Wie lautet dein Name?",
+                "Dein Name:",
                 placeholder="z.B. Anna",
-                help="Gib deinen Namen ein, um der Gruppe beizutreten."
+                help="Pro Gruppe kann ein Name nur einmal vergeben werden."
             )
-            submitted = st.form_submit_button("Gruppe beitreten", type="primary")
+            password_input = st.text_input(
+                "Dein Passwort:",
+                type="password",
+                placeholder="Passwort eingeben",
+                help="Wird benötigt, um dich in dieser Gruppe wieder einzuloggen."
+            )
+            submitted = st.form_submit_button("Anmelden / Beitreten", type="primary")
 
             if submitted:
                 cleaned_name = display_name_input.strip()
+                password = password_input.strip()
+
                 if not cleaned_name:
-                    st.warning("Bitte gib einen gültigen Namen ein.")
+                    st.warning("Bitte gib einen Namen ein.")
+                elif not password:
+                    st.warning("Bitte gib ein Passwort ein.")
                 else:
-                    try:
-                        new_user_id = database.create_user(
-                            group_id=group_id,
-                            display_name=cleaned_name,
-                            is_admin=st.session_state.get("is_admin", False)
-                        )
-                        st.session_state.user_id = new_user_id
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Fehler beim Beitreten: {exc}")
+                    existing_user = database.get_user_by_name(group_id, cleaned_name)
+                    if existing_user:
+                        # Attempt authentication
+                        auth_user = database.authenticate_user(group_id, cleaned_name, password)
+                        if auth_user:
+                            st.session_state.user_id = auth_user["user_id"]
+                            st.session_state.is_admin = auth_user["is_admin"]
+                            st.success(f"Willkommen zurück, {auth_user['display_name']}!")
+                            st.rerun()
+                        else:
+                            st.error("Falsches Passwort für diesen Benutzernamen.")
+                    else:
+                        # New user registration
+                        if user_count >= MAX_GROUP_MEMBERS:
+                            st.error(f"Diese Gruppe ist bereits voll (Maximal {MAX_GROUP_MEMBERS} Personen).")
+                        else:
+                            # First user in group or initial session admin status creates admin account
+                            is_first_user = (user_count == 0)
+                            is_admin = is_first_user or st.session_state.get("is_admin", False)
+
+                            try:
+                                new_user_id = database.create_user(
+                                    group_id=group_id,
+                                    display_name=cleaned_name,
+                                    password=password,
+                                    is_admin=is_admin
+                                )
+                                st.session_state.user_id = new_user_id
+                                st.session_state.is_admin = is_admin
+                                st.success(f"Willkommen, {cleaned_name}!")
+                                st.rerun()
+                            except ValueError as val_err:
+                                st.error(str(val_err))
+                            except Exception as exc:
+                                st.error(f"Fehler beim Erstellen des Profils: {exc}")
         return
 
-    # User is onboarded
+    # User is logged in
     user_id = st.session_state.user_id
     user_info = database.get_user(group_id, user_id)
     user_display_name = user_info["display_name"] if user_info else "Teilnehmer"
 
-    st.subheader(f"Hallo, {user_display_name}! 👋")
+    col_head1, col_head2 = st.columns([3, 1])
+    with col_head1:
+        st.subheader(f"Hallo, {user_display_name}! 👋 {'(Admin 👑)' if st.session_state.get('is_admin') else ''}")
+    with col_head2:
+        if st.button("🚪 Abmelden", use_container_width=True):
+            st.session_state.user_id = None
+            st.session_state.is_admin = False
+            st.rerun()
 
-    # Check if gender lists feature is enabled by admin
-    gender_lists_enabled = database.get_gender_lists_enabled(group_id)
+    # Build Tabs:
+    # If Admin: Namensvorschläge, Übersicht, Transparenz-Übersicht, Admin-Einstellungen
+    # If Participant: Namensvorschläge, Übersicht
+    is_admin = st.session_state.get("is_admin", False)
 
-    if gender_lists_enabled:
-        render_gender_differentiable_entry_form(group_id, user_id)
+    if is_admin:
+        tabs = st.tabs(["💡 Namensvorschläge", "📊 Übersicht", "🔍 Transparenz-Übersicht", "⚙️ Admin-Einstellungen"])
+
+        with tabs[0]:
+            gender_lists_enabled = database.get_gender_lists_enabled(group_id)
+            if gender_lists_enabled:
+                render_gender_differentiable_entry_form(group_id, user_id)
+            else:
+                render_standard_entry_form(group_id, user_id)
+
+        with tabs[1]:
+            render_overview_content(group_id)
+
+        with tabs[2]:
+            render_transparency_view(group_id)
+
+        with tabs[3]:
+            render_admin_settings(group_id)
     else:
-        render_standard_entry_form(group_id, user_id)
+        tabs = st.tabs(["💡 Namensvorschläge", "📊 Übersicht"])
 
-    st.divider()
+        with tabs[0]:
+            gender_lists_enabled = database.get_gender_lists_enabled(group_id)
+            if gender_lists_enabled:
+                render_gender_differentiable_entry_form(group_id, user_id)
+            else:
+                render_standard_entry_form(group_id, user_id)
 
-    # 5. Admin Dashboard
-    if st.session_state.get("is_admin", False):
-        render_admin_dashboard(group_id)
+        with tabs[1]:
+            render_overview_content(group_id)
 
 
 def render_standard_entry_form(group_id: str, user_id: int) -> None:
@@ -284,159 +459,86 @@ def render_gender_differentiable_entry_form(group_id: str, user_id: int) -> None
             st.caption("Noch keine Mädchennamen eingereicht.")
 
 
-def render_admin_dashboard(group_id: str) -> None:
-    """Renders admin controls, rankings, matches, transparency status, and group deletion."""
-    st.subheader("👑 Admin Dashboard")
+def render_transparency_view(group_id: str) -> None:
+    """Renders admin transparency overview showing who has submitted suggestions."""
+    st.markdown("### 🔍 Transparenz: Wer hat bereits Favoriten eingereicht?")
+    st.write("Aus Transparenzgründen kann der Admin hier einsehen, welche Mitglieder bereits Vorschläge abgegeben haben.")
 
     gender_lists_enabled = database.get_gender_lists_enabled(group_id)
 
-    # Admin Settings Expander
-    with st.expander("⚙️ Gruppen-Einstellungen & Verwaltung", expanded=True):
-        col_set1, col_set2 = st.columns([2, 1])
+    if gender_lists_enabled:
+        c_trans_m, c_trans_f = st.columns(2)
 
-        with col_set1:
-            st.markdown("#### Getrennte Geschlechterlisten (💙 Jungen / 💗 Mädchen)")
-            st.write(
-                "Aktiviere diese Option, um zwei getrennte Namenslisten (männlich & weiblich) anzuzeigen."
-            )
-            new_gender_state = st.toggle(
-                "Zwei Namenslisten nach Geschlecht aktivieren",
-                value=gender_lists_enabled,
-                key="toggle_gender_lists"
-            )
-            if new_gender_state != gender_lists_enabled:
-                database.set_gender_lists_enabled(group_id, new_gender_state)
-                st.success("Einstellung für Geschlechterlisten aktualisiert!")
-                st.rerun()
-
-        with col_set2:
-            st.markdown("#### 🗑️ Gruppe löschen")
-            st.write("Löscht die gesamte Gruppe und deren Datenbank unwiderruflich.")
-
-            if st.button("🚨 Gruppe jetzt löschen", type="secondary", use_container_width=True):
-                st.session_state["show_delete_confirm"] = True
-
-            if st.session_state.get("show_delete_confirm", False):
-                st.warning("Möchtest du diese Gruppe wirklich löschen?")
-                c_del1, c_del2 = st.columns(2)
-                with c_del1:
-                    if st.button("Ja, endgültig löschen", type="primary", use_container_width=True):
-                        database.delete_group(group_id)
-                        st.session_state["show_delete_confirm"] = False
-                        st.success("Gruppe wurde gelöscht.")
-                        clear_session_and_url()
-                with c_del2:
-                    if st.button("Abbrechen", use_container_width=True):
-                        st.session_state["show_delete_confirm"] = False
-                        st.rerun()
-
-    st.divider()
-
-    # Dashboard Tabs
-    tabs = st.tabs(["🏆 Beliebteste Namen", "🤝 Namens-Überschneidungen", "🔍 Transparenz-Übersicht"])
-
-    # TAB 1: Ranking
-    with tabs[0]:
-        if gender_lists_enabled:
-            c_m, c_f = st.columns(2)
-
-            with c_m:
-                st.markdown("#### 💙 Beliebteste Jungennamen")
-                m_ranking = database.get_group_name_ranking(group_id, gender="male")
-                if not m_ranking:
-                    st.info("Noch keine Jungennamen vorschlagen.")
-                else:
-                    df_m = pd.DataFrame(m_ranking, columns=["Name", "Stimmen"])
-                    st.dataframe(df_m, use_container_width=True, hide_index=True)
-
-            with c_f:
-                st.markdown("#### 💗 Beliebteste Mädchennamen")
-                f_ranking = database.get_group_name_ranking(group_id, gender="female")
-                if not f_ranking:
-                    st.info("Noch keine Mädchennamen vorschlagen.")
-                else:
-                    df_f = pd.DataFrame(f_ranking, columns=["Name", "Stimmen"])
-                    st.dataframe(df_f, use_container_width=True, hide_index=True)
-        else:
-            ranking = database.get_group_name_ranking(group_id)
-            if not ranking:
-                st.info("Noch keine Namensvorschläge in dieser Gruppe eingereicht.")
-            else:
-                df = pd.DataFrame(ranking, columns=["Name", "Stimmen"])
-                c1, c2 = st.columns([2, 1])
-                with c1:
-                    st.bar_chart(df.set_index("Name"))
-                with c2:
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    # TAB 2: Pairwise Matches
-    with tabs[1]:
-        if gender_lists_enabled:
-            st.markdown("#### 💙 Überschneidungen Jungennamen")
-            m_matches = database.get_group_user_matches(group_id, gender="male")
-            if not m_matches:
-                st.info("Keine Überschneidungen bei Jungennamen.")
-            else:
-                for u1, u2, count, shared in m_matches:
-                    st.write(f"⭐ **{u1} & {u2}**: {count} gemeinsame(r) Jungenname(n) ({', '.join(shared)})")
-
-            st.divider()
-
-            st.markdown("#### 💗 Überschneidungen Mädchennamen")
-            f_matches = database.get_group_user_matches(group_id, gender="female")
-            if not f_matches:
-                st.info("Keine Überschneidungen bei Mädchennamen.")
-            else:
-                for u1, u2, count, shared in f_matches:
-                    st.write(f"⭐ **{u1} & {u2}**: {count} gemeinsame(r) Mädchenname(n) ({', '.join(shared)})")
-        else:
-            matches = database.get_group_user_matches(group_id)
-            if not matches:
-                st.info("Noch keine Namens-Überschneidungen vorhanden.")
-            else:
-                for user1, user2, shared_count, shared_names in matches:
-                    names_str = ", ".join(shared_names)
-                    st.markdown(
-                        f"⭐ **{user1} & {user2}**: **{shared_count}** gemeinsame(r) Name(n)  \n"
-                        f"*Gemeinsam:* {names_str}"
-                    )
-                    st.divider()
-
-    # TAB 3: Transparency Overview
-    with tabs[2]:
-        st.markdown("### 🔍 Transparenz: Wer hat bereits Favoriten eingereicht?")
-        st.write("Aus Transparenzgründen kann der Admin hier einsehen, welche Mitglieder bereits Vorschläge abgegeben haben.")
-
-        if gender_lists_enabled:
-            c_trans_m, c_trans_f = st.columns(2)
-
-            with c_trans_m:
-                st.markdown("#### 💙 Abgabe-Status Jungennamen")
-                statuses_m = database.get_user_submission_statuses(group_id, gender="male")
-                for s in statuses_m:
-                    admin_tag = " (Admin)" if s["is_admin"] else ""
-                    if s["has_submitted"]:
-                        st.success(f"✅ **{s['display_name']}**{admin_tag}: {s['submitted_count']} Name(n)")
-                    else:
-                        st.warning(f"❌ **{s['display_name']}**{admin_tag}: Noch keine Jungennamen eingereicht")
-
-            with c_trans_f:
-                st.markdown("#### 💗 Abgabe-Status Mädchennamen")
-                statuses_f = database.get_user_submission_statuses(group_id, gender="female")
-                for s in statuses_f:
-                    admin_tag = " (Admin)" if s["is_admin"] else ""
-                    if s["has_submitted"]:
-                        st.success(f"✅ **{s['display_name']}**{admin_tag}: {s['submitted_count']} Name(n)")
-                    else:
-                        st.warning(f"❌ **{s['display_name']}**{admin_tag}: Noch keine Mädchennamen eingereicht")
-        else:
-            statuses = database.get_user_submission_statuses(group_id)
-            for s in statuses:
+        with c_trans_m:
+            st.markdown("#### 💙 Abgabe-Status Jungennamen")
+            statuses_m = database.get_user_submission_statuses(group_id, gender="male")
+            for s in statuses_m:
                 admin_tag = " (Admin)" if s["is_admin"] else ""
                 if s["has_submitted"]:
-                    st.success(f"✅ **{s['display_name']}**{admin_tag}: Hat {s['submitted_count']} Vorschlag/Vorschläge eingereicht")
+                    st.success(f"✅ **{s['display_name']}**{admin_tag}: {s['submitted_count']} Name(n)")
                 else:
-                    st.warning(f"❌ **{s['display_name']}**{admin_tag}: Hat noch keine Vorschläge eingereicht")
+                    st.warning(f"❌ **{s['display_name']}**{admin_tag}: Noch keine Jungennamen eingereicht")
+
+        with c_trans_f:
+            st.markdown("#### 💗 Abgabe-Status Mädchennamen")
+            statuses_f = database.get_user_submission_statuses(group_id, gender="female")
+            for s in statuses_f:
+                admin_tag = " (Admin)" if s["is_admin"] else ""
+                if s["has_submitted"]:
+                    st.success(f"✅ **{s['display_name']}**{admin_tag}: {s['submitted_count']} Name(n)")
+                else:
+                    st.warning(f"❌ **{s['display_name']}**{admin_tag}: Noch keine Mädchennamen eingereicht")
+    else:
+        statuses = database.get_user_submission_statuses(group_id)
+        for s in statuses:
+            admin_tag = " (Admin)" if s["is_admin"] else ""
+            if s["has_submitted"]:
+                st.success(f"✅ **{s['display_name']}**{admin_tag}: Hat {s['submitted_count']} Vorschlag/Vorschläge eingereicht")
+            else:
+                st.warning(f"❌ **{s['display_name']}**{admin_tag}: Hat noch keine Vorschläge eingereicht")
+
+
+def render_admin_settings(group_id: str) -> None:
+    """Renders admin group settings & deletion controls."""
+    gender_lists_enabled = database.get_gender_lists_enabled(group_id)
+
+    col_set1, col_set2 = st.columns([2, 1])
+
+    with col_set1:
+        st.markdown("#### Getrennte Geschlechterlisten (💙 Jungen / 💗 Mädchen)")
+        st.write(
+            "Aktiviere diese Option, um zwei getrennte Namenslisten (männlich & weiblich) anzuzeigen."
+        )
+        new_gender_state = st.toggle(
+            "Zwei Namenslisten nach Geschlecht aktivieren",
+            value=gender_lists_enabled,
+            key="toggle_gender_lists"
+        )
+        if new_gender_state != gender_lists_enabled:
+            database.set_gender_lists_enabled(group_id, new_gender_state)
+            st.success("Einstellung für Geschlechterlisten aktualisiert!")
+            st.rerun()
+
+    with col_set2:
+        st.markdown("#### 🗑️ Gruppe löschen")
+        st.write("Löscht die gesamte Gruppe und deren Datenbank unwiderruflich.")
+
+        if st.button("🚨 Gruppe jetzt löschen", type="secondary", use_container_width=True):
+            st.session_state["show_delete_confirm"] = True
+
+        if st.session_state.get("show_delete_confirm", False):
+            st.warning("Möchtest du diese Gruppe wirklich löschen?")
+            c_del1, c_del2 = st.columns(2)
+            with c_del1:
+                if st.button("Ja, endgültig löschen", type="primary", use_container_width=True):
+                    database.delete_group(group_id)
+                    st.session_state["show_delete_confirm"] = False
+                    st.success("Gruppe wurde gelöscht.")
+                    clear_session_and_url()
+            with c_del2:
+                if st.button("Abbrechen", use_container_width=True):
+                    st.session_state["show_delete_confirm"] = False
+                    st.rerun()
 
 
 def main() -> None:
@@ -453,11 +555,15 @@ def main() -> None:
 
     # Check URL parameter
     query_params = st.query_params
-    url_group_id = query_params.get("group_id", None)
+    raw_group_id = query_params.get("group_id", None)
 
-    if url_group_id:
-        st.session_state.group_id = url_group_id
-        render_participant_interface(url_group_id)
+    if raw_group_id:
+        clean_group_id, is_overview = parse_group_param(raw_group_id)
+        st.session_state.group_id = clean_group_id
+        if is_overview:
+            render_overview_view(clean_group_id)
+        else:
+            render_participant_interface(clean_group_id)
     else:
         st.session_state.group_id = None
         render_home_page()

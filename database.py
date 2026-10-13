@@ -10,9 +10,35 @@ import re
 import secrets
 import sqlite3
 import datetime
+import hashlib
 from typing import Optional, List, Tuple, Dict, Any
 
 DATA_DIR: str = "groups_data"
+
+
+def hash_password(password: str) -> str:
+    """Hashes a password string using SHA-256.
+
+    Args:
+        password: Plain text password.
+
+    Returns:
+        str: Hexadecimal SHA-256 hash.
+    """
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    """Ensures existing group databases are migrated with password_hash and unique display_name index."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users';")
+    if cursor.fetchone():
+        cursor.execute("PRAGMA table_info(users);")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "password_hash" not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_display_name ON users(display_name COLLATE NOCASE);")
+        conn.commit()
 
 
 def sanitize_group_id(group_id: str) -> str:
@@ -74,6 +100,7 @@ def get_connection(group_id: str, base_dir: str = DATA_DIR) -> sqlite3.Connectio
     db_path = get_db_path(group_id, base_dir=base_dir)
     conn: sqlite3.Connection = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON;")
+    migrate_db(conn)
     return conn
 
 
@@ -118,7 +145,8 @@ def create_group(group_id: str, base_dir: str = DATA_DIR) -> None:
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                display_name TEXT NOT NULL,
+                display_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL DEFAULT '',
                 is_admin BOOLEAN NOT NULL DEFAULT 0
             );
             """
@@ -244,28 +272,98 @@ def get_user_count(group_id: str, base_dir: str = DATA_DIR) -> int:
 
 
 def create_user(
-    group_id: str, display_name: str, is_admin: bool = False, base_dir: str = DATA_DIR
+    group_id: str, display_name: str, password: str = "", is_admin: bool = False, base_dir: str = DATA_DIR
 ) -> int:
     """Creates a user within a group's database and returns the generated user_id.
 
     Args:
         group_id: Group identifier.
         display_name: Display name of the user.
+        password: Plain text password for the user.
         is_admin: Admin status flag.
         base_dir: Directory where group database files are stored.
 
     Returns:
         int: The created user's ID.
+
+    Raises:
+        ValueError: If the display name is already taken in this group.
     """
     cleaned_name: str = display_name.strip()
+    if not cleaned_name:
+        raise ValueError("Bitte gib einen gültigen Namen ein.")
+
+    pwd_hash: str = hash_password(password)
+    with get_connection(group_id, base_dir=base_dir) as conn:
+        cursor: sqlite3.Cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO users (display_name, password_hash, is_admin) VALUES (?, ?, ?);",
+                (cleaned_name, pwd_hash, 1 if is_admin else 0),
+            )
+            conn.commit()
+            return cursor.lastrowid  # type: ignore
+        except sqlite3.IntegrityError:
+            raise ValueError(f"Der Name '{cleaned_name}' ist in dieser Gruppe bereits vergeben.")
+
+
+def get_user_by_name(
+    group_id: str, display_name: str, base_dir: str = DATA_DIR
+) -> Optional[Dict[str, Any]]:
+    """Retrieves user info by display_name from the group's database (case-insensitive).
+
+    Args:
+        group_id: Group identifier.
+        display_name: User display name.
+        base_dir: Directory where group database files are stored.
+
+    Returns:
+        Optional[dict]: Dictionary with user attributes or None if not found.
+    """
+    cleaned_name = display_name.strip()
+    if not cleaned_name:
+        return None
+
     with get_connection(group_id, base_dir=base_dir) as conn:
         cursor: sqlite3.Cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO users (display_name, is_admin) VALUES (?, ?);",
-            (cleaned_name, 1 if is_admin else 0),
+            "SELECT user_id, display_name, is_admin, password_hash FROM users WHERE display_name = ? COLLATE NOCASE;",
+            (cleaned_name,),
         )
-        conn.commit()
-        return cursor.lastrowid  # type: ignore
+        row = cursor.fetchone()
+        if row:
+            return {
+                "user_id": row[0],
+                "group_id": group_id,
+                "display_name": row[1],
+                "is_admin": bool(row[2]),
+                "password_hash": row[3],
+            }
+        return None
+
+
+def authenticate_user(
+    group_id: str, display_name: str, password: str, base_dir: str = DATA_DIR
+) -> Optional[Dict[str, Any]]:
+    """Authenticates a user against display_name and password.
+
+    Args:
+        group_id: Group identifier.
+        display_name: User display name.
+        password: Plain text password.
+        base_dir: Directory where group database files are stored.
+
+    Returns:
+        Optional[dict]: User dict if credentials match, None otherwise.
+    """
+    user = get_user_by_name(group_id, display_name, base_dir=base_dir)
+    if not user:
+        return None
+
+    pwd_hash = hash_password(password)
+    if user["password_hash"] == pwd_hash:
+        return user
+    return None
 
 
 def get_user(

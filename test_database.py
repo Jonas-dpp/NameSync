@@ -5,6 +5,7 @@ import secrets
 import sqlite3
 import pytest
 import database
+import app
 
 
 @pytest.fixture
@@ -55,13 +56,59 @@ def test_isolated_database_per_group(temp_data_dir):
     assert os.path.exists(db_path_2)
 
     # Add user to g1
-    u1_g1 = database.create_user(g1, "Alice", is_admin=True, base_dir=temp_data_dir)
+    u1_g1 = database.create_user(g1, "Alice", password="secretpassword", is_admin=True, base_dir=temp_data_dir)
     database.add_name_suggestion(g1, u1_g1, "Milo", gender="male", base_dir=temp_data_dir)
 
     # Verify g2 has no users or names
     assert database.get_user_count(g1, base_dir=temp_data_dir) == 1
     assert database.get_user_count(g2, base_dir=temp_data_dir) == 0
     assert len(database.get_group_name_ranking(g2, base_dir=temp_data_dir)) == 0
+
+
+def test_unique_usernames_and_password_authentication(temp_data_dir):
+    """Verify unique username enforcement and password authentication per group."""
+    gid = database.generate_group_id()
+    database.create_group(gid, base_dir=temp_data_dir)
+
+    # Create admin user
+    u1_id = database.create_user(gid, "AdminUser", password="adminpass123", is_admin=True, base_dir=temp_data_dir)
+    assert u1_id > 0
+
+    # Attempt to create duplicate user with same name (case-insensitive) should raise ValueError
+    with pytest.raises(ValueError, match="bereits vergeben"):
+        database.create_user(gid, "adminuser", password="anotherpassword", base_dir=temp_data_dir)
+
+    # Test authentication - correct password
+    auth_success = database.authenticate_user(gid, "ADMINUSER", "adminpass123", base_dir=temp_data_dir)
+    assert auth_success is not None
+    assert auth_success["user_id"] == u1_id
+    assert auth_success["is_admin"] is True
+
+    # Test authentication - wrong password
+    auth_fail = database.authenticate_user(gid, "AdminUser", "wrongpassword", base_dir=temp_data_dir)
+    assert auth_fail is None
+
+    # Test non-existent user lookup
+    assert database.get_user_by_name(gid, "NonExistent", base_dir=temp_data_dir) is None
+
+
+def test_parse_group_param_overview_route():
+    """Verify parsing of group_id query parameter with and without /overview route."""
+    gid = database.generate_group_id()
+
+    clean_id, is_overview = app.parse_group_param(gid)
+    assert clean_id == gid
+    assert is_overview is False
+
+    overview_param = f"{gid}/overview"
+    clean_id_ov, is_overview_ov = app.parse_group_param(overview_param)
+    assert clean_id_ov == gid
+    assert is_overview_ov is True
+
+    trailing_slash_ov = f"{gid}//overview"
+    clean_id_tr, is_overview_tr = app.parse_group_param(trailing_slash_ov)
+    assert clean_id_tr == gid
+    assert is_overview_tr is True
 
 
 def test_gender_lists_configuration(temp_data_dir):
