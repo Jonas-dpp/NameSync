@@ -249,3 +249,58 @@ def test_rankings_and_pairwise_matches(temp_data_dir):
     assert sorted([u1_name, u2_name]) == ["User1", "User2"]
     assert shared_count == 1
     assert shared_names == ["Milo"]
+
+
+def test_phonetic_name_grouping_and_representative_spelling(temp_data_dir):
+    """Verify phonetic grouping combining votes (Cologne Phonetics) and displaying representative spelling."""
+    gid = database.generate_group_id()
+    database.create_group(gid, base_dir=temp_data_dir)
+
+    u1 = database.create_user(gid, "Alice", base_dir=temp_data_dir)
+    u2 = database.create_user(gid, "Bob", base_dir=temp_data_dir)
+    u3 = database.create_user(gid, "Charlie", base_dir=temp_data_dir)
+
+    # 2 users enter "Karl", 1 enters "Carl"
+    database.add_name_suggestion(gid, u1, "Karl", gender="neutral", base_dir=temp_data_dir)
+    database.add_name_suggestion(gid, u2, "Karl", gender="neutral", base_dir=temp_data_dir)
+    database.add_name_suggestion(gid, u3, "Carl", gender="neutral", base_dir=temp_data_dir)
+
+    # 1 user enters "Philipp", 1 enters "Filip"
+    database.add_name_suggestion(gid, u1, "Philipp", gender="neutral", base_dir=temp_data_dir)
+    database.add_name_suggestion(gid, u2, "Filip", gender="neutral", base_dir=temp_data_dir)
+
+    ranking = database.get_group_name_ranking(gid, base_dir=temp_data_dir)
+    # Total votes: Karl/Carl = 3 (rep spelling "Karl"), Philipp/Filip = 2 (rep spelling "Philipp")
+    assert ranking == [("Karl", 3), ("Philipp", 2)]
+
+    # Test pairwise matches using phonetic codes
+    # Alice ("Karl", "Philipp") & Charlie ("Carl") should match on "Karl"
+    matches = database.get_group_user_matches(gid, base_dir=temp_data_dir)
+    alice_charlie_match = [m for m in matches if set([m[0], m[1]]) == {"Alice", "Charlie"}][0]
+    assert alice_charlie_match[2] == 1
+    assert alice_charlie_match[3] == ["Karl"]
+
+
+def test_per_user_phonetic_uniqueness(temp_data_dir):
+    """Verify an individual user cannot submit duplicate or phonetically identical names."""
+    gid = database.generate_group_id()
+    database.create_group(gid, base_dir=temp_data_dir)
+
+    u1 = database.create_user(gid, "Alice", base_dir=temp_data_dir)
+
+    # First submission succeeds
+    id1 = database.add_name_suggestion(gid, u1, "Philipp", gender="neutral", base_dir=temp_data_dir)
+    assert id1 is not None
+
+    # Phonetically identical submission by same user fails with ValueError
+    with pytest.raises(ValueError, match="bereits einen ähnlich klingenden Namen"):
+        database.add_name_suggestion(gid, u1, "Filip", gender="neutral", base_dir=temp_data_dir)
+
+    # Exact duplicate submission by same user fails
+    with pytest.raises(ValueError, match="bereits einen ähnlich klingenden Namen"):
+        database.add_name_suggestion(gid, u1, "Philipp", gender="neutral", base_dir=temp_data_dir)
+
+    # Different user can submit "Filip"
+    u2 = database.create_user(gid, "Bob", base_dir=temp_data_dir)
+    id2 = database.add_name_suggestion(gid, u2, "Filip", gender="neutral", base_dir=temp_data_dir)
+    assert id2 is not None

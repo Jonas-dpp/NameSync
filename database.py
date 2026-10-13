@@ -12,8 +12,29 @@ import sqlite3
 import datetime
 import hashlib
 from typing import Optional, List, Tuple, Dict, Any
+from cologne_phonetics import encode
 
 DATA_DIR: str = "groups_data"
+
+
+def encode_phonetic(name: str) -> str:
+    """Generates phonetic code using Cologne Phonetics for a given name string.
+
+    Args:
+        name: Name string.
+
+    Returns:
+        str: Phonetic code string.
+    """
+    if not name or not name.strip():
+        return ""
+    try:
+        res = encode(name.strip())
+        if res and len(res) > 0:
+            return res[0][1]
+    except Exception:
+        pass
+    return ""
 
 
 def hash_password(password: str) -> str:
@@ -29,7 +50,7 @@ def hash_password(password: str) -> str:
 
 
 def migrate_db(conn: sqlite3.Connection) -> None:
-    """Ensures existing group databases are migrated with password_hash and unique display_name index."""
+    """Ensures existing group databases are migrated with password_hash, unique display_name index, and phonetic_code."""
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users';")
     if cursor.fetchone():
@@ -38,7 +59,21 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         if "password_hash" not in columns:
             cursor.execute("ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';")
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_display_name ON users(display_name COLLATE NOCASE);")
-        conn.commit()
+
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='names';")
+    if cursor.fetchone():
+        cursor.execute("PRAGMA table_info(names);")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "phonetic_code" not in columns:
+            cursor.execute("ALTER TABLE names ADD COLUMN phonetic_code TEXT NOT NULL DEFAULT '';")
+
+        cursor.execute("SELECT name_id, suggested_name FROM names WHERE phonetic_code = '' OR phonetic_code IS NULL;")
+        rows = cursor.fetchall()
+        for name_id, suggested_name in rows:
+            code = encode_phonetic(suggested_name)
+            cursor.execute("UPDATE names SET phonetic_code = ? WHERE name_id = ?;", (code, name_id))
+
+    conn.commit()
 
 
 def sanitize_group_id(group_id: str) -> str:
@@ -159,6 +194,7 @@ def create_group(group_id: str, base_dir: str = DATA_DIR) -> None:
                 user_id INTEGER NOT NULL,
                 suggested_name TEXT NOT NULL,
                 gender TEXT NOT NULL DEFAULT 'neutral',
+                phonetic_code TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
             );
             """
@@ -401,8 +437,9 @@ def add_name_suggestion(
 ) -> Optional[int]:
     """Normalizes and adds a name suggestion for a user in the group.
 
-    Name is trimmed and converted to Title Case. Empty names are ignored.
-    Gender must be 'male', 'female', or 'neutral'.
+    Name is trimmed and converted to Title Case. Phonetic code is generated.
+    Enforces per-user phonetic uniqueness so a user cannot submit duplicate or phonetically identical names.
+    Empty names are ignored. Gender must be 'male', 'female', or 'neutral'.
 
     Args:
         group_id: Group identifier.
@@ -413,18 +450,44 @@ def add_name_suggestion(
 
     Returns:
         Optional[int]: Generated name_id, or None if input was empty.
+
+    Raises:
+        ValueError: If user has already submitted a phonetically identical name in this list.
     """
     normalized_name: str = name.strip().title()
     if not normalized_name:
         return None
 
     valid_gender = gender if gender in ("male", "female", "neutral") else "neutral"
+    code = encode_phonetic(normalized_name)
 
     with get_connection(group_id, base_dir=base_dir) as conn:
         cursor: sqlite3.Cursor = conn.cursor()
+
+        if code:
+            cursor.execute(
+                "SELECT suggested_name FROM names WHERE user_id = ? AND gender = ? AND phonetic_code = ?;",
+                (user_id, valid_gender, code),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                raise ValueError(
+                    f"Du hast bereits einen ähnlich klingenden Namen ('{existing[0]}') eingereicht."
+                )
+        else:
+            cursor.execute(
+                "SELECT suggested_name FROM names WHERE user_id = ? AND gender = ? AND suggested_name = ? COLLATE NOCASE;",
+                (user_id, valid_gender, normalized_name),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                raise ValueError(
+                    f"Du hast den Namen '{existing[0]}' bereits eingereicht."
+                )
+
         cursor.execute(
-            "INSERT INTO names (user_id, suggested_name, gender) VALUES (?, ?, ?);",
-            (user_id, normalized_name, valid_gender),
+            "INSERT INTO names (user_id, suggested_name, gender, phonetic_code) VALUES (?, ?, ?, ?);",
+            (user_id, normalized_name, valid_gender, code),
         )
         conn.commit()
         return cursor.lastrowid  # type: ignore
@@ -459,10 +522,54 @@ def get_user_names(
         return [row[0] for row in cursor.fetchall()]
 
 
+def get_representative_spelling_map(
+    conn: sqlite3.Connection, gender: Optional[str] = None
+) -> Dict[str, str]:
+    """Helper to determine representative (most frequent) spelling per phonetic_code.
+
+    Args:
+        conn: SQLite database connection.
+        gender: Optional gender filter.
+
+    Returns:
+        Dict[str, str]: Mapping from phonetic_code to representative name spelling.
+    """
+    cursor = conn.cursor()
+    if gender:
+        cursor.execute(
+            """
+            SELECT phonetic_code, suggested_name, COUNT(*) as cnt, MIN(name_id) as min_id
+            FROM names
+            WHERE gender = ? AND phonetic_code != '' AND phonetic_code IS NOT NULL
+            GROUP BY phonetic_code, suggested_name
+            ORDER BY cnt DESC, min_id ASC;
+            """,
+            (gender,),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT phonetic_code, suggested_name, COUNT(*) as cnt, MIN(name_id) as min_id
+            FROM names
+            WHERE phonetic_code != '' AND phonetic_code IS NOT NULL
+            GROUP BY phonetic_code, suggested_name
+            ORDER BY cnt DESC, min_id ASC;
+            """
+        )
+
+    rep_map: Dict[str, str] = {}
+    for code, spelling, _, _ in cursor.fetchall():
+        if code not in rep_map:
+            rep_map[code] = spelling
+    return rep_map
+
+
 def get_group_name_ranking(
     group_id: str, gender: Optional[str] = None, base_dir: str = DATA_DIR
 ) -> List[Tuple[str, int]]:
-    """Retrieves ranked list of names for a group sorted by frequency.
+    """Retrieves ranked list of names grouped by phonetic_code for a group.
+
+    The displayed label for each phonetic group is the most frequently entered spelling.
 
     Args:
         group_id: Group identifier.
@@ -470,37 +577,46 @@ def get_group_name_ranking(
         base_dir: Directory where group database files are stored.
 
     Returns:
-        List[Tuple[str, int]]: List of (suggested_name, count) tuples.
+        List[Tuple[str, int]]: List of (representative_name, total_count) tuples.
     """
     with get_connection(group_id, base_dir=base_dir) as conn:
         cursor: sqlite3.Cursor = conn.cursor()
+        rep_map = get_representative_spelling_map(conn, gender=gender)
+
         if gender:
             cursor.execute(
                 """
-                SELECT suggested_name, COUNT(*) as count
+                SELECT phonetic_code, suggested_name, COUNT(*) as count
                 FROM names
                 WHERE gender = ?
-                GROUP BY suggested_name
-                ORDER BY count DESC, suggested_name ASC;
+                GROUP BY CASE WHEN phonetic_code != '' AND phonetic_code IS NOT NULL THEN phonetic_code ELSE suggested_name END
+                ORDER BY count DESC;
                 """,
                 (gender,),
             )
         else:
             cursor.execute(
                 """
-                SELECT suggested_name, COUNT(*) as count
+                SELECT phonetic_code, suggested_name, COUNT(*) as count
                 FROM names
-                GROUP BY suggested_name
-                ORDER BY count DESC, suggested_name ASC;
+                GROUP BY CASE WHEN phonetic_code != '' AND phonetic_code IS NOT NULL THEN phonetic_code ELSE suggested_name END
+                ORDER BY count DESC;
                 """
             )
-        return [(row[0], row[1]) for row in cursor.fetchall()]
+
+        results: List[Tuple[str, int]] = []
+        for code, fallback_spelling, count in cursor.fetchall():
+            label = rep_map.get(code, fallback_spelling) if code else fallback_spelling
+            results.append((label, count))
+
+        results.sort(key=lambda x: (-x[1], x[0]))
+        return results
 
 
 def get_group_user_matches(
     group_id: str, gender: Optional[str] = None, base_dir: str = DATA_DIR
 ) -> List[Tuple[str, str, int, List[str]]]:
-    """Calculates name intersections between pairs of users in a group.
+    """Calculates phonetic name intersections between pairs of users in a group.
 
     Args:
         group_id: Group identifier.
@@ -520,25 +636,31 @@ def get_group_user_matches(
         if len(users) < 2:
             return []
 
-        user_names_map: Dict[int, set[str]] = {}
+        rep_map = get_representative_spelling_map(conn, gender=gender)
+
+        user_codes_map: Dict[int, Dict[str, str]] = {}
         for uid, _ in users:
             if gender:
                 cursor.execute(
-                    "SELECT suggested_name FROM names WHERE user_id = ? AND gender = ?;",
+                    "SELECT phonetic_code, suggested_name FROM names WHERE user_id = ? AND gender = ?;",
                     (uid, gender),
                 )
             else:
                 cursor.execute(
-                    "SELECT suggested_name FROM names WHERE user_id = ?;", (uid,)
+                    "SELECT phonetic_code, suggested_name FROM names WHERE user_id = ?;", (uid,)
                 )
-            user_names_map[uid] = {row[0] for row in cursor.fetchall()}
+            user_codes_map[uid] = {}
+            for code, name_str in cursor.fetchall():
+                key = code if code else name_str
+                user_codes_map[uid][key] = name_str
 
     matches: List[Tuple[str, str, int, List[str]]] = []
     for (u1_id, u1_name), (u2_id, u2_name) in itertools.combinations(users, 2):
-        shared: set[str] = user_names_map[u1_id] & user_names_map[u2_id]
-        if shared:
-            sorted_shared = sorted(shared)
-            matches.append((u1_name, u2_name, len(shared), sorted_shared))
+        shared_keys: set[str] = set(user_codes_map[u1_id].keys()) & set(user_codes_map[u2_id].keys())
+        if shared_keys:
+            shared_names = [rep_map.get(k, user_codes_map[u1_id][k]) for k in shared_keys]
+            sorted_shared = sorted(shared_names)
+            matches.append((u1_name, u2_name, len(shared_keys), sorted_shared))
 
     matches.sort(key=lambda item: (-item[2], item[0], item[1]))
     return matches
