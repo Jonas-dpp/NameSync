@@ -1,211 +1,204 @@
-"""Unit tests for database module in Name Sync (Sprint 1)."""
+"""Comprehensive unit and edge case tests for Name Sync."""
 
+import os
+import secrets
 import sqlite3
 import pytest
 import database
 
 
 @pytest.fixture
-def test_db(tmp_path):
-    """Provides a temporary database file path and initializes schema."""
-    db_file = str(tmp_path / "test_namesync.db")
-    database.init_db(db_file)
-    return db_file
+def temp_data_dir(tmp_path):
+    """Provides an isolated temporary directory for group databases."""
+    d = tmp_path / "groups_data"
+    d.mkdir()
+    return str(d)
 
 
-def test_init_db_creates_tables(test_db):
-    """Test that groups, users, and names tables are created correctly."""
-    with database.get_connection(test_db) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = {row[0] for row in cursor.fetchall()}
+def test_high_entropy_random_url():
+    """Verify generated group URLs are long and cryptographically secure."""
+    url1 = database.generate_group_id()
+    url2 = database.generate_group_id()
 
-    assert "groups" in tables
-    assert "users" in tables
-    assert "names" in tables
+    assert isinstance(url1, str)
+    assert len(url1) >= 40
+    assert url1 != url2
 
 
-def test_foreign_key_cascade_deletion(test_db):
-    """Test that deleting a group cascades deletion to users and names."""
-    group_id = "test-group-123"
+def test_sanitize_group_id_security():
+    """Verify path traversal and injection prevention in group IDs."""
+    assert database.sanitize_group_id("normal_id_123") == "normal_id_123"
 
-    with database.get_connection(test_db) as conn:
-        cursor = conn.cursor()
+    with pytest.raises(ValueError, match="Invalid group_id"):
+        database.sanitize_group_id("../../../etc/passwd")
 
-        # Insert group
-        cursor.execute("INSERT INTO groups (group_id) VALUES (?);", (group_id,))
+    with pytest.raises(ValueError, match="Invalid group_id"):
+        database.sanitize_group_id("group; DROP TABLE users;")
 
-        # Insert user
-        cursor.execute(
-            "INSERT INTO users (group_id, display_name, is_admin) VALUES (?, ?, ?);",
-            (group_id, "Alice", True),
-        )
-        user_id = cursor.lastrowid
-
-        # Insert name suggestion
-        cursor.execute(
-            "INSERT INTO names (user_id, suggested_name) VALUES (?, ?);",
-            (user_id, "Luna"),
-        )
-        conn.commit()
-
-        # Verify data exists
-        cursor.execute("SELECT COUNT(*) FROM users WHERE group_id = ?;", (group_id,))
-        assert cursor.fetchone()[0] == 1
-
-        cursor.execute("SELECT COUNT(*) FROM names WHERE user_id = ?;", (user_id,))
-        assert cursor.fetchone()[0] == 1
-
-        # Delete group
-        cursor.execute("DELETE FROM groups WHERE group_id = ?;", (group_id,))
-        conn.commit()
-
-        # Verify cascade deletion
-        cursor.execute("SELECT COUNT(*) FROM users WHERE group_id = ?;", (group_id,))
-        assert cursor.fetchone()[0] == 0
-
-        cursor.execute("SELECT COUNT(*) FROM names WHERE user_id = ?;", (user_id,))
-        assert cursor.fetchone()[0] == 0
+    with pytest.raises(ValueError, match="Invalid group_id"):
+        database.sanitize_group_id("")
 
 
-def test_cleanup_old_groups(test_db):
-    """Test that groups older than 7 days are deleted by cleanup_old_groups."""
-    with database.get_connection(test_db) as conn:
-        cursor = conn.cursor()
+def test_isolated_database_per_group(temp_data_dir):
+    """Verify each group gets a separate database file and data is completely isolated."""
+    g1 = database.generate_group_id()
+    g2 = database.generate_group_id()
 
-        # Insert new group (created now)
-        cursor.execute("INSERT INTO groups (group_id) VALUES (?);", ("new-group",))
+    database.create_group(g1, base_dir=temp_data_dir)
+    database.create_group(g2, base_dir=temp_data_dir)
 
-        # Insert old group (created 8 days ago)
-        cursor.execute(
-            "INSERT INTO groups (group_id, created_at) VALUES (?, datetime('now', '-8 days'));",
-            ("old-group",),
-        )
+    db_path_1 = database.get_db_path(g1, base_dir=temp_data_dir)
+    db_path_2 = database.get_db_path(g2, base_dir=temp_data_dir)
 
-        # Insert old group user and name
-        cursor.execute(
-            "INSERT INTO users (group_id, display_name) VALUES (?, ?);",
-            ("old-group", "Bob"),
-        )
-        user_id = cursor.lastrowid
-        cursor.execute(
-            "INSERT INTO names (user_id, suggested_name) VALUES (?, ?);",
-            (user_id, "Milo"),
-        )
-        conn.commit()
+    assert db_path_1 != db_path_2
+    assert os.path.exists(db_path_1)
+    assert os.path.exists(db_path_2)
 
-    # Run cleanup
-    deleted_count = database.cleanup_old_groups(days=7, db_name=test_db)
+    # Add user to g1
+    u1_g1 = database.create_user(g1, "Alice", is_admin=True, base_dir=temp_data_dir)
+    database.add_name_suggestion(g1, u1_g1, "Milo", gender="male", base_dir=temp_data_dir)
+
+    # Verify g2 has no users or names
+    assert database.get_user_count(g1, base_dir=temp_data_dir) == 1
+    assert database.get_user_count(g2, base_dir=temp_data_dir) == 0
+    assert len(database.get_group_name_ranking(g2, base_dir=temp_data_dir)) == 0
+
+
+def test_gender_lists_configuration(temp_data_dir):
+    """Verify gender lists toggle defaults to disabled (False) and can be toggled."""
+    gid = database.generate_group_id()
+    database.create_group(gid, base_dir=temp_data_dir)
+
+    # Default = disabled
+    assert database.get_gender_lists_enabled(gid, base_dir=temp_data_dir) is False
+
+    # Enable option
+    database.set_gender_lists_enabled(gid, True, base_dir=temp_data_dir)
+    assert database.get_gender_lists_enabled(gid, base_dir=temp_data_dir) is True
+
+    # Disable option
+    database.set_gender_lists_enabled(gid, False, base_dir=temp_data_dir)
+    assert database.get_gender_lists_enabled(gid, base_dir=temp_data_dir) is False
+
+
+def test_gender_differentiable_name_submissions(temp_data_dir):
+    """Verify male, female, and neutral name submissions and filtering."""
+    gid = database.generate_group_id()
+    database.create_group(gid, base_dir=temp_data_dir)
+
+    u1 = database.create_user(gid, "Bob", base_dir=temp_data_dir)
+
+    m1 = database.add_name_suggestion(gid, u1, "   liam   ", gender="male", base_dir=temp_data_dir)
+    f1 = database.add_name_suggestion(gid, u1, "emma", gender="female", base_dir=temp_data_dir)
+    empty = database.add_name_suggestion(gid, u1, "   ", gender="male", base_dir=temp_data_dir)
+
+    assert m1 is not None
+    assert f1 is not None
+    assert empty is None
+
+    # Verify normalization
+    assert database.get_user_names(gid, u1, gender="male", base_dir=temp_data_dir) == ["Liam"]
+    assert database.get_user_names(gid, u1, gender="female", base_dir=temp_data_dir) == ["Emma"]
+
+
+def test_transparency_admin_view(temp_data_dir):
+    """Verify admin transparency feature tracks who has and hasn't picked top names."""
+    gid = database.generate_group_id()
+    database.create_group(gid, base_dir=temp_data_dir)
+
+    admin = database.create_user(gid, "Admin User", is_admin=True, base_dir=temp_data_dir)
+    p1 = database.create_user(gid, "Anna", is_admin=False, base_dir=temp_data_dir)
+    p2 = database.create_user(gid, "Ben", is_admin=False, base_dir=temp_data_dir)
+
+    # Anna submits a male name and a female name
+    database.add_name_suggestion(gid, p1, "Leo", gender="male", base_dir=temp_data_dir)
+    database.add_name_suggestion(gid, p1, "Maya", gender="female", base_dir=temp_data_dir)
+
+    # General transparency check
+    statuses = database.get_user_submission_statuses(gid, base_dir=temp_data_dir)
+    status_dict = {s["display_name"]: s for s in statuses}
+
+    assert status_dict["Admin User"]["has_submitted"] is False
+    assert status_dict["Admin User"]["submitted_count"] == 0
+
+    assert status_dict["Anna"]["has_submitted"] is True
+    assert status_dict["Anna"]["submitted_count"] == 2
+
+    assert status_dict["Ben"]["has_submitted"] is False
+    assert status_dict["Ben"]["submitted_count"] == 0
+
+    # Male-specific transparency check
+    male_statuses = database.get_user_submission_statuses(gid, gender="male", base_dir=temp_data_dir)
+    male_dict = {s["display_name"]: s for s in male_statuses}
+    assert male_dict["Anna"]["has_submitted"] is True
+    assert male_dict["Anna"]["submitted_count"] == 1
+
+    # Female-specific transparency check
+    female_statuses = database.get_user_submission_statuses(gid, gender="female", base_dir=temp_data_dir)
+    female_dict = {s["display_name"]: s for s in female_statuses}
+    assert female_dict["Ben"]["has_submitted"] is False
+
+
+def test_group_deletion_and_stale_link(temp_data_dir):
+    """Verify group deletion removes DB file and renders URL stale."""
+    gid = database.generate_group_id()
+    database.create_group(gid, base_dir=temp_data_dir)
+    assert database.group_exists(gid, base_dir=temp_data_dir) is True
+
+    # Delete
+    success = database.delete_group(gid, base_dir=temp_data_dir)
+    assert success is True
+
+    # Link stale check
+    assert database.group_exists(gid, base_dir=temp_data_dir) is False
+    assert not os.path.exists(database.get_db_path(gid, base_dir=temp_data_dir))
+
+
+def test_auto_cleanup_after_7_days(temp_data_dir):
+    """Verify groups older than 7 days are automatically deleted."""
+    g_fresh = database.generate_group_id()
+    g_old = database.generate_group_id()
+
+    database.create_group(g_fresh, base_dir=temp_data_dir)
+    database.create_group(g_old, base_dir=temp_data_dir)
+
+    # Set created_at of g_old to 8 days ago
+    db_path_old = database.get_db_path(g_old, base_dir=temp_data_dir)
+    conn = sqlite3.connect(db_path_old)
+    conn.execute(
+        "UPDATE group_info SET created_at = datetime('now', '-8 days') WHERE group_id = ?;",
+        (g_old,),
+    )
+    conn.commit()
+    conn.close()
+
+    deleted_count = database.cleanup_old_groups(days=7, base_dir=temp_data_dir)
     assert deleted_count == 1
 
-    # Verify remaining database state
-    with database.get_connection(test_db) as conn:
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT group_id FROM groups;")
-        groups = [row[0] for row in cursor.fetchall()]
-        assert "new-group" in groups
-        assert "old-group" not in groups
-
-        cursor.execute("SELECT COUNT(*) FROM users;")
-        assert cursor.fetchone()[0] == 0
-
-        cursor.execute("SELECT COUNT(*) FROM names;")
-        assert cursor.fetchone()[0] == 0
+    assert database.group_exists(g_fresh, base_dir=temp_data_dir) is True
+    assert database.group_exists(g_old, base_dir=temp_data_dir) is False
 
 
-def test_group_creation_and_existence(test_db):
-    """Test group creation and group_exists function."""
-    group_id = "grp-abc"
-    assert not database.group_exists(group_id, db_name=test_db)
+def test_rankings_and_pairwise_matches(temp_data_dir):
+    """Verify gender-specific group rankings and pairwise user match calculations."""
+    gid = database.generate_group_id()
+    database.create_group(gid, base_dir=temp_data_dir)
 
-    database.create_group(group_id, db_name=test_db)
-    assert database.group_exists(group_id, db_name=test_db)
+    u1 = database.create_user(gid, "User1", base_dir=temp_data_dir)
+    u2 = database.create_user(gid, "User2", base_dir=temp_data_dir)
 
+    database.add_name_suggestion(gid, u1, "Milo", gender="male", base_dir=temp_data_dir)
+    database.add_name_suggestion(gid, u1, "Noah", gender="male", base_dir=temp_data_dir)
+    database.add_name_suggestion(gid, u2, "Milo", gender="male", base_dir=temp_data_dir)
 
-def test_user_creation_lookup_and_count(test_db):
-    """Test user creation, lookup, and counting."""
-    group_id = "grp-users"
-    database.create_group(group_id, db_name=test_db)
+    # Rankings
+    male_ranking = database.get_group_name_ranking(gid, gender="male", base_dir=temp_data_dir)
+    assert male_ranking == [("Milo", 2), ("Noah", 1)]
 
-    assert database.get_user_count(group_id, db_name=test_db) == 0
-
-    user_id = database.create_user(
-        group_id, "  Alice  ", is_admin=True, db_name=test_db
-    )
-    user_info = database.get_user(user_id, db_name=test_db)
-
-    assert user_info is not None
-    assert user_info["user_id"] == user_id
-    assert user_info["group_id"] == group_id
-    assert user_info["display_name"] == "Alice"
-    assert user_info["is_admin"] is True
-    assert database.get_user_count(group_id, db_name=test_db) == 1
-
-
-def test_add_name_suggestion_and_normalization(test_db):
-    """Test name suggestion addition and Title-Case normalization."""
-    group_id = "grp-names"
-    database.create_group(group_id, db_name=test_db)
-    user_id = database.create_user(group_id, "Bob", db_name=test_db)
-
-    # Adding whitespace / mixed case
-    name_id1 = database.add_name_suggestion(user_id, " anna maria ", db_name=test_db)
-    name_id2 = database.add_name_suggestion(user_id, "LUNA", db_name=test_db)
-    empty_id = database.add_name_suggestion(user_id, "   ", db_name=test_db)
-
-    assert name_id1 is not None
-    assert name_id2 is not None
-    assert empty_id is None
-
-    user_names = database.get_user_names(user_id, db_name=test_db)
-    assert user_names == ["Anna Maria", "Luna"]
-
-
-def test_group_name_ranking(test_db):
-    """Test aggregated group name ranking sorting."""
-    group_id = "grp-ranking"
-    database.create_group(group_id, db_name=test_db)
-
-    u1 = database.create_user(group_id, "User1", db_name=test_db)
-    u2 = database.create_user(group_id, "User2", db_name=test_db)
-
-    database.add_name_suggestion(u1, "Luna", db_name=test_db)
-    database.add_name_suggestion(u1, "Milo", db_name=test_db)
-
-    database.add_name_suggestion(u2, "Luna", db_name=test_db)
-    database.add_name_suggestion(u2, "Noah", db_name=test_db)
-
-    ranking = database.get_group_name_ranking(group_id, db_name=test_db)
-    # Expected: Luna (2), Milo (1), Noah (1)
-    assert ranking == [("Luna", 2), ("Milo", 1), ("Noah", 1)]
-
-
-def test_group_user_matches(test_db):
-    """Test pairwise user matching intersection calculation."""
-    group_id = "grp-matches"
-    database.create_group(group_id, db_name=test_db)
-
-    u1 = database.create_user(group_id, "Anna", db_name=test_db)
-    u2 = database.create_user(group_id, "Thomas", db_name=test_db)
-    u3 = database.create_user(group_id, "Clara", db_name=test_db)
-
-    database.add_name_suggestion(u1, "Luna", db_name=test_db)
-    database.add_name_suggestion(u1, "Milo", db_name=test_db)
-    database.add_name_suggestion(u1, "Leo", db_name=test_db)
-
-    database.add_name_suggestion(u2, "Luna", db_name=test_db)
-    database.add_name_suggestion(u2, "Milo", db_name=test_db)
-
-    database.add_name_suggestion(u3, "Luna", db_name=test_db)
-
-    matches = database.get_group_user_matches(group_id, db_name=test_db)
-    # Anna & Thomas share 2 names ("Luna", "Milo")
-    # Anna & Clara share 1 name ("Luna")
-    # Thomas & Clara share 1 name ("Luna")
-
-    assert len(matches) == 3
-    first_match = matches[0]
-    assert set([first_match[0], first_match[1]]) == {"Anna", "Thomas"}
-    assert first_match[2] == 2
-    assert first_match[3] == ["Luna", "Milo"]
+    # User Matches
+    matches = database.get_group_user_matches(gid, gender="male", base_dir=temp_data_dir)
+    assert len(matches) == 1
+    u1_name, u2_name, shared_count, shared_names = matches[0]
+    assert sorted([u1_name, u2_name]) == ["User1", "User2"]
+    assert shared_count == 1
+    assert shared_names == ["Milo"]
